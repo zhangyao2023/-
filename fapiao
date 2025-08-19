@@ -1,0 +1,301 @@
+import base64
+import urllib
+import requests
+import json
+from collections import defaultdict
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+import openpyxl
+import datetime
+import xml.etree.ElementTree as ET
+import os
+import tkinter.messagebox as messagebox
+
+# 全局变量：存储发票识别结果
+global_result_df = pd.DataFrame()  # 初始化为空DataFrame
+
+
+
+# 定义打开文件选择框的函数
+def open_file_dialog():
+    file_paths = filedialog.askopenfilename(
+        title="选择发票文件",
+        filetypes=[("所有支持格式", "*.pdf;*.ofd;*.xml;*.jpg;*.png;*.jpeg")],
+        multiple=True)
+    if file_paths:
+        path_var.set(file_paths)
+    return file_paths
+
+
+def shibie(a):
+    url = "https://aip.baidubce.com/rest/2.0/ocr/v1/vat_invoice?access_token=" + get_access_token()
+
+    pdf_file = get_file_content_as_base64(a, True)
+    if a.endswith((".pdf")):
+        biaotou = "pdf_file=" + pdf_file
+    elif a.endswith((".ofd")):
+        biaotou = "ofd_file=" + pdf_file
+    else:
+        biaotou = "image=" + pdf_file
+    payload = biaotou
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json'
+    }
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    json_data = response.text
+    data = json.loads(json_data)
+
+    # 定义常量
+    STR_DEFAULT = '无'  # 字符串默认值
+    LIST_DEFAULT = [('1', STR_DEFAULT)]  # 列表默认值
+    NUM_DEFAULT = 0  # 数值默认值
+
+    # 辅助函数：填充字段至最大行数，确保所有商品字段行数一致
+    def fill_rows(items, max_row, default_word=STR_DEFAULT):
+        filled = []
+        for i in range(1, max_row + 1):
+            # 按行号匹配数据，缺失行用默认值填充
+            row_data = next((item for item in items if item['row'] == str(i)), None)
+            if row_data:
+                filled.append((str(i), row_data['word']))
+            else:
+                filled.append((str(i), default_word))
+        return filled
+
+    # 提取所有商品字段原始数据（避免直接使用or LIST_DEFAULT导致行数固定为1）
+    commodity_fields = {
+        'name': data['words_result'].get('CommodityName', []),  # 商品名称
+        'amount': data['words_result'].get('CommodityAmount', []),  # 不含税金额
+        'tax': data['words_result'].get('CommodityTax', []),  # 税额
+        'unit': data['words_result'].get('CommodityUnit', []),  # 单位
+        'price': data['words_result'].get('CommodityPrice', []),  # 单价（解决为空时错位的核心字段）
+        'tax_rate': data['words_result'].get('CommodityTaxRate', []),  # 税率
+        'num': data['words_result'].get('CommodityNum', []),  # 数量
+        'type': data['words_result'].get('CommodityType', []),  # 规格型号
+    }
+
+    # 计算最大行数（动态适配多商品场景，避免行数不一致）
+    max_rows = max(len(items) for items in commodity_fields.values()) if any(commodity_fields.values()) else 1
+    if max_rows == 0:
+        max_rows = 1  # 兜底：至少保留1行
+
+    # 统一填充所有商品字段至最大行数，解决字段为空或行数不足导致的错位
+    kaipiaoneirong = fill_rows(commodity_fields['name'], max_rows)
+    buhanshuijine = fill_rows(commodity_fields['amount'], max_rows)
+    shuie = fill_rows(commodity_fields['tax'], max_rows)
+    danwei = fill_rows(commodity_fields['unit'], max_rows)
+    danjia = fill_rows(commodity_fields['price'], max_rows)  # 单价字段按最大行数填充
+    shuilv = fill_rows(commodity_fields['tax_rate'], max_rows)
+    shuliang = fill_rows(commodity_fields['num'], max_rows)
+    guigexinghao = fill_rows(commodity_fields['type'], max_rows)
+
+    # 提取非商品字段（单值字段，无需处理行数）
+    fapiaoleixing = data['words_result']['InvoiceTypeOrg']
+    xiaofeileixing = data['words_result']['ServiceType']
+    fapiaobiaozhi = data['words_result']['InvoiceTag']
+    goumaifangmingcheng = data['words_result']['PurchaserName']
+    goumaifangshuihao = data['words_result']['PurchaserRegisterNum']
+    xiaoshoufangmingcheng = data['words_result']['SellerName']
+    xiaoshoufangshuihao = data['words_result']['SellerRegisterNum']
+    kaipiaoriqi = data['words_result']['InvoiceDate']
+    fapiaohaoma = data['words_result']['InvoiceNum']
+
+    # 合并商品字段数据（此时所有字段行数已统一，不会错位）
+    combined_dict = defaultdict(list)
+    for key, kpnr in kaipiaoneirong: combined_dict[key].append(kpnr)
+    for key, bhsje in buhanshuijine: combined_dict[key].append(bhsje)
+    for key, se in shuie: combined_dict[key].append(se)
+    for key, dw in danwei: combined_dict[key].append(dw)
+    for key, dj in danjia: combined_dict[key].append(dj)  # 单价数据已按最大行数填充
+    for key, sl in shuilv: combined_dict[key].append(sl)
+    for key, shul in shuliang: combined_dict[key].append(shul)
+    for key, ggxh in guigexinghao: combined_dict[key].append(ggxh)
+
+    # 构建DataFrame并整理格式
+    df = pd.DataFrame.from_dict(combined_dict, orient='index')
+    df.columns = ['开票内容', '不含税金额', '税额', '单位', '单价', '税率', '数量', '规格型号']
+    df.fillna('', inplace=True)
+
+    # 添加发票头部信息
+    df['发票类型'] = fapiaoleixing
+    df['消费类型'] = xiaofeileixing
+    df['增值税发票左上角标志'] = fapiaobiaozhi
+    df['购方名称'] = goumaifangmingcheng
+    df['购方税号'] = goumaifangshuihao
+    df['销售方名称'] = xiaoshoufangmingcheng
+    df['销售方税号'] = xiaoshoufangshuihao
+    df['开票日期'] = kaipiaoriqi
+    df['发票号码'] = fapiaohaoma
+    df['文件地址'] = a
+    df['价税合计'] = df['不含税金额'] + df['税额']
+
+    # 调整列顺序
+    df = df[['发票号码', '开票日期', '发票类型', '消费类型', '增值税发票左上角标志', '购方名称', '购方税号',
+             '销售方名称', '销售方税号', '开票内容', '单位', '不含税金额', '税额', '价税合计', '单价', '税率', '数量',
+             '规格型号', '文件地址']]
+
+    return df
+
+
+def get_file_content_as_base64(path, urlencoded=False):
+    with open(path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("utf8")
+        if urlencoded:
+            content = urllib.parse.quote_plus(content)
+    return content
+
+
+def get_access_token():
+    # 从输入框获取最新密钥
+    url = "https://aip.baidubce.com/oauth/2.0/token"
+    params = {
+        "grant_type": "client_credentials",
+        "client_id": api_key_var.get(),
+        "client_secret": secret_key_var.get()
+    }
+    return str(requests.post(url, params=params).json().get("access_token"))
+
+
+def parse_einvoice(a):
+
+    tree = ET.parse(a)
+    root = tree.getroot()
+    header = root.find('Header')
+    tax_supervision = root.find('TaxSupervisionInfo')
+    base_info = {
+        '发票号码': tax_supervision.find('InvoiceNumber').text,
+        '开票日期': tax_supervision.find('IssueTime').text,
+        '发票类型': header.find('.//GeneralOrSpecialVAT/LabelName').text,
+        '消费类型': header.find('.//UndefinedLabel/Label[1]/LabelName').text,
+        '增值税发票左上角标志': "其他",
+        '购方名称': root.find('.//BuyerInformation/BuyerName').text,
+        '购方税号': root.find('.//BuyerInformation/BuyerIdNum').text,
+        '销售方名称': root.find('.//SellerInformation/SellerName').text,
+        '销售方税号': root.find('.//SellerInformation/SellerIdNum').text,
+    }
+    items = []
+    for idx, item in enumerate(root.findall('.//IssuItemInformation'), 1):
+        item_data = {
+            '开票内容': item.findtext('ItemName'),
+            '单位': item.findtext('MeaUnits'),
+            '不含税金额': item.findtext('Amount'),
+            '税额': item.findtext('ComTaxAm'),
+            '单价': item.findtext('UnPrice'),
+            '税率': item.findtext('TaxRate'),
+            '数量': item.findtext('Quantity'),
+            '规格型号': item.findtext('SpecMod'),
+            '价税合计': item.findtext('TotaltaxIncludedAmount'),
+            '文件地址': a
+        }
+        items.append({**base_info, **item_data})
+    return pd.DataFrame(items)
+
+
+def main1():
+    global global_result_df
+    result = pd.DataFrame()
+    lujing = open_file_dialog()
+    for b in lujing:
+        if b.endswith(".xml"):
+            df = parse_einvoice(b)
+            numeric_cols = ['数量', '单价', '不含税金额', '税额', '价税合计']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            columns_order = ['发票号码', '开票日期', '发票类型', '消费类型', '增值税发票左上角标志', '购方名称',
+                             '购方税号',
+                             '销售方名称', '销售方税号', '开票内容', '单位', '不含税金额', '税额','价税合计', '单价', '税率',
+                             '数量',
+                             '规格型号', '文件地址']
+            d = df[columns_order]
+            result = pd.concat([result, d], ignore_index=True)
+        else:
+            c = shibie(b)
+            result = pd.concat([result, c], ignore_index=True)
+            result['不含税金额'] = pd.to_numeric(result['不含税金额'], errors='coerce')
+            result['税额'] = pd.to_numeric(result['税额'], errors='coerce')
+            result['价税合计']=result['不含税金额']+result['税额']
+    global_result_df = result.copy()
+    messagebox.showinfo("成功", f"已完成 {len(lujing)} 个文件的识别！")
+
+
+def on_export_click():
+    global global_result_df
+    try:
+        if global_result_df.empty:
+            messagebox.showwarning("提示", "请先点击【打开文件选择框】处理发票！")
+            return
+        output_dir = filedialog.askdirectory(title="选择输出文件夹", parent=root, mustexist=True)
+        if not output_dir:
+            messagebox.showinfo("提示", "已取消导出")
+            return
+        current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"发票内容识别_{current_time}.xlsx"
+        file_path = os.path.join(output_dir, filename)
+        global_result_df.to_excel(file_path, index=False)
+        messagebox.showinfo("成功", f"文件已保存至：\n{output_dir}")
+    except Exception as e:
+        messagebox.showerror("错误", f"导出失败：{str(e)}")
+
+
+# 创建主窗口
+root = tk.Tk()
+root.title("发票识别工具")
+root.geometry("600x550")  # 窗口高度增加以容纳输入框
+
+# 配置网格布局权重
+for row in [0, 1, 2, 3, 4]:
+    root.grid_rowconfigure(row, weight=1)
+root.grid_columnconfigure(0, weight=1)
+root.grid_columnconfigure(1, weight=1)
+
+# 功能说明标签
+label = tk.Label(
+    root,
+    text="本程序可识别纸质发票扫描件、PDF/OFD、xml等格式发票文件",
+    font=("Arial", 10),
+    wraplength=500,
+    justify="left",
+    fg="#333333"
+)
+label.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky="nsew")
+api_key_var = tk.StringVar(value="aaaaaaaaaaaaaaaaaaaa")  # API Key输入变量
+secret_key_var = tk.StringVar(value="xxxxxxxxxxxxxxxxxxxxxxxxx")  # Secret Key输入变量
+# API Key输入框
+tk.Label(root, text="API Key:", font=("Arial", 10)).grid(row=1, column=0, padx=10, pady=2, sticky="w")
+tk.Entry(root, textvariable=api_key_var, show="*", font=("Arial", 10)).grid(row=1, column=1, padx=10, pady=2,
+                                                                            sticky="ew")
+
+# Secret Key输入框
+tk.Label(root, text="Secret Key:", font=("Arial", 10)).grid(row=2, column=0, padx=10, pady=2, sticky="w")
+tk.Entry(root, textvariable=secret_key_var, show="*", font=("Arial", 10)).grid(row=2, column=1, padx=10, pady=2,
+                                                                               sticky="ew")
+
+# 文件路径显示标签
+path_var = tk.StringVar()
+path_label = tk.Label(
+    root,
+    textvariable=path_var,
+    font=("Arial", 12),
+    width=70,
+    height=10,  # 高度减少以适应新布局
+    bd=1,
+    relief="solid",
+    bg="white",
+    anchor="w",
+    padx=10,
+    pady=5,
+    wraplength=550,
+    justify="left"
+)
+path_label.grid(row=3, column=0, columnspan=2, padx=20, pady=10, sticky="ew")
+
+# 操作按钮
+btn_select = tk.Button(root, text="选择发票文件", command=main1, bg="#4CAF50", fg="white", font=("Arial", 12))
+btn_select.grid(row=4, column=0, padx=20, pady=10, sticky="ew")
+
+btn_recognize = tk.Button(root, text="导出EXCEL", command=on_export_click, bg="#4CAF50", fg="white", font=("Arial", 12))
+btn_recognize.grid(row=4, column=1, padx=50, pady=10, sticky="ew")
+
+root.mainloop()
