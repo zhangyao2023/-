@@ -1,0 +1,2 @@
+该脚本，识别图片发票、PDF、OFD发票调用百度API，需自行申请百度API的key、可填入代码aaaaaaaaaaa和xxxxxxxxxxxx、或运行程序时填入亦可。
+百度API可以申请试用即可。每月免费2000次。
